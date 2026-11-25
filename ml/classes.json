@@ -1,0 +1,9 @@
+{
+  "classes": ["rectangle", "diamond", "oval", "arrowhead"],
+  "coco_categories": [
+    { "id": 1, "name": "rectangle", "supercategory": "shape" },
+    { "id": 2, "name": "diamond", "supercategory": "shape" },
+    { "id": 3, "name": "oval", "supercategory": "shape" },
+    { "id": 4, "name": "arrowhead", "supercategory": "connector" }
+  ]
+}

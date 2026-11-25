@@ -1,0 +1,11 @@
+node_modules/
+dist/
+ml/dataset/
+whiteboard-flow/public/ort/
+*.pth
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+.kilo/
+.kilocode/
