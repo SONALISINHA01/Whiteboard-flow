@@ -747,6 +747,20 @@ textarea,
   color: #5D6680;
 }
 
+.wf-diag-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.wf-diag-controls button {
+  height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+
 .wf-status-bar {
   display: flex;
   flex-direction: column;

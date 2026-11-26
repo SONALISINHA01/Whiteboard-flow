@@ -81,7 +81,7 @@ describe('YOLOX preprocessing and postprocessing', () => {
   });
 
   it('computes inset crop rect inside shape bounds for OCR', () => {
-    const rect = computeInsideShapeCropRect({ x: 100, y: 100, width: 200, height: 100 }, 640, 640, 0.1);
-    expect(rect).toEqual({ x: 120, y: 110, width: 160, height: 80 });
+    const rect = computeInsideShapeCropRect({ x: 100, y: 100, width: 200, height: 100 }, 640, 640, 'rectangle');
+    expect(rect).toEqual({ x: 124, y: 116, width: 152, height: 68 });
   });
 });

@@ -17,7 +17,8 @@ import {
   type DetectionBox,
   type LetterboxTransform,
 } from '../vision/coords';
-import { recognizeShapeLabelsInWorker } from '../vision/ocrClient';
+import { recognizeBranchLabelsInWorker, recognizeShapeLabelsInWorker } from '../vision/ocrClient';
+import { filterAndDeduplicateDetections, type FilteredDetections } from '../vision/shapeFilter';
 import type { DetectorWorkerRequest, DetectorWorkerResponse } from '../workers/detector.worker';
 
 export interface PhotoPanelHandle {
@@ -127,14 +128,17 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
   const [loadedPhoto, setLoadedPhoto] = useState<LoadedPhoto | null>(null);
   const [cropRect, setCropRect] = useState<CropRect>({ x: 0, y: 0, width: 100, height: 100 });
   const [croppedPhoto, setCroppedPhoto] = useState<CroppedPhoto | null>(null);
-  const [detections, setDetections] = useState<DetectionBox[]>([]);
-  const [showOverlay, setShowOverlay] = useState(true);
+  const [rawDetections, setRawDetections] = useState<DetectionBox[]>([]);
+  const [filteredSummary, setFilteredSummary] = useState<FilteredDetections | null>(null);
+  const [showPhoto, setShowPhoto] = useState(true);
+  const [showBoxes, setShowBoxes] = useState(true);
   const [selectedDetection, setSelectedDetection] = useState<DetectionBox | null>(null);
   const [labelCropUrl, setLabelCropUrl] = useState<string | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
 
   const [detectorStatus, setDetectorStatus] = useState<string>('Ready');
   const [ocrStatus, setOcrStatus] = useState<string>('Ready');
+  const [activeStage, setActiveStage] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [lastInferenceMeta, setLastInferenceMeta] = useState<string | null>(null);
 
@@ -142,8 +146,13 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
   const fileInputRef = useRef<HTMLInputElement>(null);
   const croppedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const detectorWorkerRef = useRef<Worker | null>(null);
-  const pendingConvertResolveRef = useRef<((dets: DetectionBox[]) => void) | null>(null);
+  const pendingDetectResolveRef = useRef<((dets: DetectionBox[]) => void) | null>(null);
   const conversionActiveRef = useRef(false);
+
+  const reportStage = (stage: string | null) => {
+    setActiveStage(stage);
+    onStatusStep?.(stage);
+  };
 
   useEffect(() => {
     const worker = new Worker(new URL('../workers/detector.worker.ts', import.meta.url), {
@@ -160,38 +169,36 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
             : msg.stage === 'preprocessing'
               ? 'Preparing photo...'
               : msg.stage === 'inferencing'
-                ? 'Finding shapes and arrows...'
+                ? 'Detecting shapes...'
                 : msg.stage === 'postprocessing'
-                  ? 'Aligning boxes...'
+                  ? 'Aligning detections...'
                   : 'Detector ready';
         setDetectorStatus(plain);
         if (conversionActiveRef.current && msg.stage !== 'model-ready') {
-          onStatusStep?.(plain);
+          reportStage(plain);
         }
       } else if (msg.type === 'result') {
-        setDetections(msg.detections);
-        setLastInferenceMeta(
-          `${msg.detections.length} detections in ${msg.inferenceMs}ms`,
-        );
-        setDetectorStatus('Shapes found');
-        if (pendingConvertResolveRef.current) {
-          const resolve = pendingConvertResolveRef.current;
-          pendingConvertResolveRef.current = null;
+        setRawDetections(msg.detections);
+        setLastInferenceMeta(`${msg.detections.length} raw detections in ${msg.inferenceMs}ms`);
+        setDetectorStatus(`Detected ${msg.detections.length} raw boxes`);
+        if (pendingDetectResolveRef.current) {
+          const resolve = pendingDetectResolveRef.current;
+          pendingDetectResolveRef.current = null;
           resolve(msg.detections);
         } else {
           conversionActiveRef.current = false;
-          onStatusStep?.(null);
+          reportStage(null);
           setIsBusy(false);
         }
       } else if (msg.type === 'error') {
-        setDetectorStatus(`Detector unavailable (${msg.message})`);
-        if (pendingConvertResolveRef.current) {
-          const resolve = pendingConvertResolveRef.current;
-          pendingConvertResolveRef.current = null;
+        setDetectorStatus(`Detector error: ${msg.message}`);
+        if (pendingDetectResolveRef.current) {
+          const resolve = pendingDetectResolveRef.current;
+          pendingDetectResolveRef.current = null;
           resolve([]);
         } else {
           conversionActiveRef.current = false;
-          onStatusStep?.(null);
+          reportStage(null);
           setIsBusy(false);
         }
       }
@@ -203,9 +210,12 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
       worker.terminate();
       detectorWorkerRef.current = null;
     };
-  }, [onStatusStep]);
+  }, []);
 
-  const applyCropToPhoto = (photo: LoadedPhoto, rect: CropRect): Promise<{ cropped: CroppedPhoto; canvas: HTMLCanvasElement; initialDetections: DetectionBox[] }> => {
+  const applyCropToPhoto = (
+    photo: LoadedPhoto,
+    rect: CropRect,
+  ): Promise<{ cropped: CroppedPhoto; canvas: HTMLCanvasElement; initialDetections: DetectionBox[] }> => {
     return new Promise((resolve) => {
       const img = new Image();
       img.onload = () => {
@@ -215,7 +225,7 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
         const canvas = document.createElement('canvas');
         canvas.width = cw;
         canvas.height = ch;
-        const ctx = canvas.getContext('2d')!;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
         ctx.drawImage(img, rect.x, rect.y, cw, ch, 0, 0, cw, ch);
         croppedCanvasRef.current = canvas;
 
@@ -228,7 +238,8 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
         };
         const initialDetections = createSampleDetections(cw, ch);
         setCroppedPhoto(cropped);
-        setDetections(initialDetections);
+        setRawDetections(initialDetections);
+        setFilteredSummary(null);
         setSelectedDetection(null);
         setLabelCropUrl(null);
         resolve({ cropped, canvas, initialDetections });
@@ -254,10 +265,12 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
         height: Math.round(img.naturalHeight * 0.9),
       });
       setCroppedPhoto(null);
-      setDetections([]);
+      setRawDetections([]);
+      setFilteredSummary(null);
       setSelectedDetection(null);
       setLabelCropUrl(null);
       setLastInferenceMeta(null);
+      setShowPhoto(true);
       onPhotoSelected?.(true);
     };
     img.src = dataUrl;
@@ -282,80 +295,124 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
     setLoadedPhoto(sample);
     setCropRect({ x: 0, y: 0, width: sample.width, height: sample.height });
     setCroppedPhoto(null);
-    setDetections([]);
+    setRawDetections([]);
+    setFilteredSummary(null);
     setSelectedDetection(null);
     setLabelCropUrl(null);
     setLastInferenceMeta(null);
+    setShowPhoto(true);
     onPhotoSelected?.(true);
+  };
+
+  const runDetectorOnCanvas = async (
+    canvas: HTMLCanvasElement,
+    width: number,
+    height: number,
+  ): Promise<DetectionBox[]> => {
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx || !detectorWorkerRef.current) return rawDetections;
+    const imageData = ctx.getImageData(0, 0, width, height);
+    return new Promise<DetectionBox[]>((resolve) => {
+      pendingDetectResolveRef.current = resolve;
+      detectorWorkerRef.current!.postMessage({
+        type: 'detect',
+        requestId: `req-${Date.now()}`,
+        rgba: imageData.data,
+        width,
+        height,
+      } satisfies DetectorWorkerRequest);
+    });
   };
 
   const handleConvertFlow = async () => {
     if (!loadedPhoto) return;
     setIsBusy(true);
     conversionActiveRef.current = true;
-    onStatusStep?.('Preparing photo...');
+    reportStage('Preparing photo...');
 
-    let activeCropped = croppedPhoto;
-    let activeCanvas = croppedCanvasRef.current;
-    let activeDetections = detections;
-
-    if (!activeCropped || !activeCanvas) {
-      const result = await applyCropToPhoto(loadedPhoto, cropRect);
-      activeCropped = result.cropped;
-      activeCanvas = result.canvas;
-      activeDetections = result.initialDetections;
-    }
-
-    const ctx = activeCanvas.getContext('2d');
-    if (ctx && detectorWorkerRef.current) {
-      const imageData = ctx.getImageData(0, 0, activeCropped.width, activeCropped.height);
-      const detected = await new Promise<DetectionBox[]>((resolve) => {
-        pendingConvertResolveRef.current = resolve;
-        detectorWorkerRef.current!.postMessage({
-          type: 'detect',
-          requestId: `req-${Date.now()}`,
-          rgba: imageData.data,
-          width: activeCropped!.width,
-          height: activeCropped!.height,
-        } satisfies DetectorWorkerRequest);
-      });
-      if (detected.length > 0) {
-        activeDetections = detected;
-      }
-    }
-
-    onStatusStep?.('Reading labels...');
     try {
-      const withLabels = await recognizeShapeLabelsInWorker(
-        activeCanvas,
-        activeDetections,
-        (status) => {
-          setOcrStatus(status);
-          onStatusStep?.('Reading labels...');
-        },
-      );
-      activeDetections = withLabels;
-      setDetections(withLabels);
-    } catch {
-      // Keep existing labels if PP-OCRv5 models are not present
-      setOcrStatus('Using detected/default labels');
-    }
+      let activeCropped = croppedPhoto;
+      let activeCanvas = croppedCanvasRef.current;
+      let activeRaw = rawDetections;
 
-    onStatusStep?.('Connecting diagram...');
-    if (ctx && onGraphBuilt) {
+      if (!activeCropped || !activeCanvas) {
+        const res = await applyCropToPhoto(loadedPhoto, cropRect);
+        activeCropped = res.cropped;
+        activeCanvas = res.canvas;
+        activeRaw = res.initialDetections;
+      }
+
+      reportStage('Detecting shapes...');
+      const detected = await runDetectorOnCanvas(
+        activeCanvas,
+        activeCropped.width,
+        activeCropped.height,
+      );
+      if (detected.length > 0) {
+        activeRaw = detected;
+        setRawDetections(detected);
+      }
+
+      const ctx = activeCanvas.getContext('2d', { willReadFrequently: true })!;
       const imageData = ctx.getImageData(0, 0, activeCropped.width, activeCropped.height);
       const ink = binarizeToInkMask(imageData.data, activeCropped.width, activeCropped.height);
-      const builtGraph = buildGraphFromDetections(activeDetections, ink);
-      onGraphBuilt(builtGraph, {
+
+      const filtered = filterAndDeduplicateDetections(
+        activeRaw,
+        ink,
+        activeCropped.width,
+        activeCropped.height,
+      );
+      setFilteredSummary(filtered);
+
+      reportStage('Reading labels...');
+      let labeledShapes = filtered.acceptedShapes;
+      try {
+        labeledShapes = await recognizeShapeLabelsInWorker(
+          activeCanvas,
+          filtered.acceptedShapes,
+          (status) => {
+            setOcrStatus(status);
+            reportStage(status);
+          },
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setOcrStatus(`OCR error: ${message}`);
+      }
+
+      reportStage('Resolving arrows...');
+      const combined = [...labeledShapes, ...filtered.plausibleArrowheads];
+      setRawDetections([...combined, ...filtered.doubtfulShapes, ...filtered.rejectedArrowheads]);
+      const builtGraph = buildGraphFromDetections(combined, ink);
+
+      try {
+        const edgesWithBranchLabels = await recognizeBranchLabelsInWorker(
+          activeCanvas,
+          builtGraph.edges,
+          builtGraph.nodes,
+          labeledShapes,
+          ink,
+          (status) => {
+            setOcrStatus(status);
+            reportStage(status);
+          },
+        );
+        builtGraph.edges = edgesWithBranchLabels;
+      } catch {
+        // Keep edges even if branch OCR fails
+      }
+
+      onGraphBuilt?.(builtGraph, {
         dataUrl: activeCropped.dataUrl,
         width: activeCropped.width,
         height: activeCropped.height,
       });
+    } finally {
+      conversionActiveRef.current = false;
+      reportStage(null);
+      setIsBusy(false);
     }
-
-    conversionActiveRef.current = false;
-    onStatusStep?.(null);
-    setIsBusy(false);
   };
 
   useImperativeHandle(ref, () => ({
@@ -400,61 +457,103 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
     setDragStart(null);
   };
 
-  const handleRunOnnxDetector = () => {
-    if (!croppedCanvasRef.current || !croppedPhoto || !detectorWorkerRef.current) return;
-    const ctx = croppedCanvasRef.current.getContext('2d');
-    if (!ctx) return;
-
-    const imageData = ctx.getImageData(0, 0, croppedPhoto.width, croppedPhoto.height);
+  const handleDiagDetect = async () => {
+    if (!croppedCanvasRef.current || !croppedPhoto) return;
     setIsBusy(true);
     conversionActiveRef.current = true;
-    onStatusStep?.('Finding shapes and arrows...');
-    detectorWorkerRef.current.postMessage({
-      type: 'detect',
-      requestId: `req-${Date.now()}`,
-      rgba: imageData.data,
-      width: croppedPhoto.width,
-      height: croppedPhoto.height,
-    } satisfies DetectorWorkerRequest);
-  };
-
-  const handleRunOcr = async () => {
-    if (!croppedCanvasRef.current || detections.length === 0) return;
-    setIsBusy(true);
-    onStatusStep?.('Reading labels...');
+    reportStage('Detecting shapes...');
     try {
-      const withLabels = await recognizeShapeLabelsInWorker(
+      const detected = await runDetectorOnCanvas(
         croppedCanvasRef.current,
-        detections,
-        (status) => {
-          setOcrStatus(status);
-          onStatusStep?.('Reading labels...');
-        },
+        croppedPhoto.width,
+        croppedPhoto.height,
       );
-      setDetections(withLabels);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setOcrStatus(`OCR unavailable (${message})`);
+      if (detected.length > 0) {
+        setRawDetections(detected);
+      }
     } finally {
-      onStatusStep?.(null);
+      conversionActiveRef.current = false;
+      reportStage(null);
       setIsBusy(false);
     }
   };
 
-  const handleBuildGraph = () => {
+  const handleDiagOcr = async () => {
+    if (!croppedCanvasRef.current || !croppedPhoto || rawDetections.length === 0) return;
+    setIsBusy(true);
+    conversionActiveRef.current = true;
+    reportStage('Reading labels...');
+    try {
+      const ctx = croppedCanvasRef.current.getContext('2d', { willReadFrequently: true })!;
+      const imageData = ctx.getImageData(0, 0, croppedPhoto.width, croppedPhoto.height);
+      const ink = binarizeToInkMask(imageData.data, croppedPhoto.width, croppedPhoto.height);
+      const filtered = filterAndDeduplicateDetections(
+        rawDetections,
+        ink,
+        croppedPhoto.width,
+        croppedPhoto.height,
+      );
+      setFilteredSummary(filtered);
+      const labeled = await recognizeShapeLabelsInWorker(
+        croppedCanvasRef.current,
+        filtered.acceptedShapes,
+        (status) => {
+          setOcrStatus(status);
+          reportStage(status);
+        },
+      );
+      setRawDetections([
+        ...labeled,
+        ...filtered.plausibleArrowheads,
+        ...filtered.doubtfulShapes,
+        ...filtered.rejectedArrowheads,
+      ]);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setOcrStatus(`OCR error: ${message}`);
+    } finally {
+      conversionActiveRef.current = false;
+      reportStage(null);
+      setIsBusy(false);
+    }
+  };
+
+  const handleDiagBuild = async () => {
     if (!croppedCanvasRef.current || !croppedPhoto || !onGraphBuilt) return;
-    const ctx = croppedCanvasRef.current.getContext('2d');
+    const ctx = croppedCanvasRef.current.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
-    onStatusStep?.('Connecting diagram...');
+    reportStage('Resolving arrows...');
     const imageData = ctx.getImageData(0, 0, croppedPhoto.width, croppedPhoto.height);
     const ink = binarizeToInkMask(imageData.data, croppedPhoto.width, croppedPhoto.height);
-    const builtGraph = buildGraphFromDetections(detections, ink);
+    const filtered = filterAndDeduplicateDetections(
+      rawDetections,
+      ink,
+      croppedPhoto.width,
+      croppedPhoto.height,
+    );
+    setFilteredSummary(filtered);
+    const builtGraph = buildGraphFromDetections(
+      [...filtered.acceptedShapes, ...filtered.plausibleArrowheads],
+      ink,
+    );
+    try {
+      builtGraph.edges = await recognizeBranchLabelsInWorker(
+        croppedCanvasRef.current,
+        builtGraph.edges,
+        builtGraph.nodes,
+        filtered.acceptedShapes,
+        ink,
+        setOcrStatus,
+      );
+    } catch {
+      // Keep edges if branch OCR unavailable
+    }
     onGraphBuilt(builtGraph, {
       dataUrl: croppedPhoto.dataUrl,
       width: croppedPhoto.width,
       height: croppedPhoto.height,
     });
-    onStatusStep?.(null);
+    reportStage(null);
   };
 
   const handleSelectDetection = (det: DetectionBox) => {
@@ -479,6 +578,11 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
     );
     setLabelCropUrl(cropCanvas.toDataURL('image/png'));
   };
+
+  const doubtfulIds = new Set([
+    ...(filteredSummary?.doubtfulShapes.map((d) => d.id) ?? []),
+    ...(filteredSummary?.rejectedArrowheads.map((d) => d.id) ?? []),
+  ]);
 
   return (
     <section className="wf-photo-panel">
@@ -558,76 +662,84 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
       {croppedPhoto && (
         <div className="wf-cropped-container">
           <div className="wf-cropped-toolbar">
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              <button type="button" onClick={handleRunOnnxDetector} disabled={isBusy}>
-                Detect shapes
-              </button>
-              <button type="button" onClick={handleRunOcr} disabled={isBusy || detections.length === 0}>
-                Read labels
-              </button>
-              <button type="button" onClick={handleBuildGraph} disabled={isBusy || detections.length === 0}>
-                Build diagram
-              </button>
-              <button type="button" onClick={() => setShowOverlay((v) => !v)}>
-                {showOverlay ? 'Hide boxes' : 'Show boxes'}
-              </button>
-            </div>
+            <button
+              type="button"
+              className="wf-primary-btn"
+              onClick={() => void handleConvertFlow()}
+              disabled={isBusy}
+            >
+              {activeStage ? activeStage : 'Convert photo'}
+            </button>
+            <button type="button" onClick={() => setShowPhoto((v) => !v)}>
+              {showPhoto ? 'Hide photo' : 'Show photo'}
+            </button>
+            <button type="button" onClick={() => setShowBoxes((v) => !v)}>
+              {showBoxes ? 'Hide boxes' : 'Show boxes'}
+            </button>
             <button type="button" onClick={() => setCroppedPhoto(null)}>
               Re-crop
             </button>
           </div>
 
-          <div className="wf-overlay-stage">
-            <img src={croppedPhoto.dataUrl} alt="Cropped whiteboard" />
-            {showOverlay && (
-              <svg
-                className="wf-overlay-svg"
-                viewBox={`0 0 ${croppedPhoto.width} ${croppedPhoto.height}`}
-                preserveAspectRatio="none"
-              >
-                {detections.map((det) => {
-                  const isSelected = selectedDetection?.id === det.id;
-                  const stroke = det.kind === 'arrow' || det.kind === 'arrowhead' ? '#ea580c' : '#2563eb';
-                  return (
-                    <g
-                      key={det.id}
-                      onClick={() => handleSelectDetection(det)}
-                      style={{ cursor: 'pointer' }}
-                    >
-                      <rect
-                        x={det.box.x}
-                        y={det.box.y}
-                        width={det.box.width}
-                        height={det.box.height}
-                        fill={isSelected ? 'rgba(37, 99, 235, 0.16)' : 'rgba(37, 99, 235, 0.06)'}
-                        stroke={stroke}
-                        strokeWidth={Math.max(2, croppedPhoto.width * 0.004)}
-                      />
-                      <text
-                        x={det.box.x + 6}
-                        y={Math.max(16, det.box.y - 6)}
-                        fill={stroke}
-                        fontSize={Math.max(12, Math.round(croppedPhoto.width * 0.022))}
-                        fontWeight="600"
+          {showPhoto && (
+            <div className="wf-overlay-stage">
+              <img src={croppedPhoto.dataUrl} alt="Cropped whiteboard" />
+              {showBoxes && (
+                <svg
+                  className="wf-overlay-svg"
+                  viewBox={`0 0 ${croppedPhoto.width} ${croppedPhoto.height}`}
+                  preserveAspectRatio="none"
+                >
+                  {rawDetections.map((det) => {
+                    const isSelected = selectedDetection?.id === det.id;
+                    const isDoubtful = doubtfulIds.has(det.id);
+                    const stroke = isDoubtful
+                      ? '#94A3B8'
+                      : det.kind === 'arrow' || det.kind === 'arrowhead'
+                        ? '#EA580C'
+                        : '#2563EB';
+                    return (
+                      <g
+                        key={det.id}
+                        onClick={() => handleSelectDetection(det)}
+                        style={{ cursor: 'pointer' }}
                       >
-                        {det.kind}
-                        {det.label ? `: ${det.label}` : ''} ({Math.round(det.confidence * 100)}%)
-                      </text>
-                    </g>
-                  );
-                })}
-                {highlightedArrow && highlightedArrow.points.length >= 2 && (
-                  <polyline
-                    points={highlightedArrow.points.map((p) => `${p.x},${p.y}`).join(' ')}
-                    fill="none"
-                    stroke="#B45309"
-                    strokeWidth={Math.max(5, croppedPhoto.width * 0.008)}
-                    strokeDasharray="10 6"
-                  />
-                )}
-              </svg>
-            )}
-          </div>
+                        <rect
+                          x={det.box.x}
+                          y={det.box.y}
+                          width={det.box.width}
+                          height={det.box.height}
+                          fill={isSelected ? 'rgba(37, 99, 235, 0.16)' : 'rgba(37, 99, 235, 0.04)'}
+                          stroke={stroke}
+                          strokeDasharray={isDoubtful ? '6 4' : undefined}
+                          strokeWidth={Math.max(2, croppedPhoto.width * 0.004)}
+                        />
+                        <text
+                          x={det.box.x + 6}
+                          y={Math.max(16, det.box.y - 6)}
+                          fill={stroke}
+                          fontSize={Math.max(12, Math.round(croppedPhoto.width * 0.022))}
+                          fontWeight="600"
+                        >
+                          {det.kind}
+                          {det.label ? `: ${det.label}` : ''} ({Math.round(det.confidence * 100)}%)
+                        </text>
+                      </g>
+                    );
+                  })}
+                  {highlightedArrow && highlightedArrow.points.length >= 2 && (
+                    <polyline
+                      points={highlightedArrow.points.map((p) => `${p.x},${p.y}`).join(' ')}
+                      fill="none"
+                      stroke="#B45309"
+                      strokeWidth={Math.max(5, croppedPhoto.width * 0.008)}
+                      strokeDasharray="10 6"
+                    />
+                  )}
+                </svg>
+              )}
+            </div>
+          )}
 
           {selectedDetection && (
             <div className="wf-label-crop-card">
@@ -647,6 +759,25 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
 
           <details className="wf-diagnostics">
             <summary>Diagnostics</summary>
+            <div className="wf-diag-controls">
+              <button type="button" onClick={() => void handleDiagDetect()} disabled={isBusy}>
+                Detect shapes
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDiagOcr()}
+                disabled={isBusy || rawDetections.length === 0}
+              >
+                Read labels
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDiagBuild()}
+                disabled={isBusy || rawDetections.length === 0}
+              >
+                Build diagram
+              </button>
+            </div>
             <div className="wf-status-bar">
               <span>
                 <strong>Shape detector:</strong> {detectorStatus}
@@ -655,6 +786,13 @@ export const PhotoPanel = forwardRef<PhotoPanelHandle, PhotoPanelProps>(function
                 <strong>Label reader:</strong> {ocrStatus}
               </span>
               {lastInferenceMeta && <span className="wf-hint">{lastInferenceMeta}</span>}
+              {filteredSummary && (
+                <span className="wf-hint">
+                  Accepted shapes: {filteredSummary.acceptedShapes.length} · Doubtful:{' '}
+                  {filteredSummary.doubtfulShapes.length} · Rejected marks:{' '}
+                  {filteredSummary.rejectedArrowheads.length}
+                </span>
+              )}
               <span className="wf-hint">
                 Letterbox scale {croppedPhoto.letterbox.scale.toFixed(3)}, pad{' '}
                 {Math.round(croppedPhoto.letterbox.padX)}×{Math.round(croppedPhoto.letterbox.padY)}
